@@ -655,14 +655,14 @@ class TestMigrations:
         finally:
             conn.close()
 
-        # Startup upgrade: migration 1 applies once and creates the new tables
-        # without touching existing data.
+        # Startup upgrade: pending migrations apply once, creating the new
+        # tables/columns without touching existing data.
         database.init_db(db_path)
         conn = sqlite3.connect(db_path)
         try:
             versions = [r[0] for r in conn.execute(
                 "SELECT version FROM schema_migrations ORDER BY version")]
-            assert versions == [1]
+            assert versions == [1, 2]
             row = conn.execute(
                 "SELECT session_id FROM sessions WHERE session_id = 'legacy-s'"
             ).fetchone()
@@ -673,6 +673,15 @@ class TestMigrations:
             }
             assert {"correlated_rules", "correlated_conditions",
                     "correlated_events"} <= names
+            # v2: sealing/close columns added by ALTER TABLE.
+            session_cols = {
+                r[1] for r in conn.execute("PRAGMA table_info(sessions)")
+            }
+            assert "closed_at" in session_cols
+            source_cols = {
+                r[1] for r in conn.execute("PRAGMA table_info(session_sources)")
+            }
+            assert "final_observed_at" in source_cols
         finally:
             conn.close()
 

@@ -14,6 +14,13 @@ Guarantees implemented here:
   quarantine table and never mutates history.
 * Re-posting the same ``(source_id, seq)`` with the same payload is an
   idempotent no-op; a different payload is a 409 conflict.
+* A source can be **sealed** with a declared ``final_observed_at`` (not
+  earlier than its max seen event time). Sealed sources reject new keys
+  (exact duplicates of existing readings still count as duplicates). When
+  the *last* open source seals, every remaining buffered reading is
+  published in the deterministic order inside the same write transaction,
+  both alert pipelines advance, and the session becomes ``closed`` — after
+  which any new key is rejected.
 """
 from __future__ import annotations
 
@@ -42,6 +49,7 @@ __all__ = [
     "ingest_batch",
     "list_published",
     "list_quarantined",
+    "seal_source",
 ]
 
 
@@ -74,6 +82,14 @@ def _source_maxes(conn: sqlite3.Connection, session_id: str) -> dict[str, Option
         (session_id,),
     ).fetchall()
     return {r["source_id"]: r["max_observed_at"] for r in rows}
+
+
+def _source_rows(conn: sqlite3.Connection, session_id: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT source_id, max_observed_at, final_observed_at"
+        " FROM session_sources WHERE session_id = ?",
+        (session_id,),
+    ).fetchall()
 
 
 def _compute_watermark(
@@ -154,16 +170,38 @@ def create_session(
 def get_session(conn: sqlite3.Connection, session_id: str) -> dict[str, Any]:
     with read_transaction(conn):
         row = _load_session(conn, session_id)
-        source_max = _source_maxes(conn, session_id)
+        src_rows = _source_rows(conn, session_id)
+    by_source = {r["source_id"]: r for r in src_rows}
+    declared = json.loads(row["source_ids"])
+    sources = [
+        {
+            "source_id": sid,
+            "max_observed_at": (
+                format_event_time(parse_event_time(by_source[sid]["max_observed_at"]))
+                if by_source[sid]["max_observed_at"]
+                else None
+            ),
+            "final_observed_at": (
+                format_event_time(parse_event_time(by_source[sid]["final_observed_at"]))
+                if by_source[sid]["final_observed_at"]
+                else None
+            ),
+        }
+        for sid in declared
+    ]
+    source_max = {sid: by_source[sid]["max_observed_at"] for sid in declared}
     all_reported = bool(source_max) and all(v is not None for v in source_max.values())
-    effective = (
-        _compute_watermark(source_max, row["allowed_lateness_seconds"])
-        if all_reported
-        else None
-    )
+    closed = row["closed_at"] is not None
+    if closed:
+        # The tail drain already fixed the final watermark; it never moves again.
+        effective = row["published_watermark"]
+    elif all_reported:
+        effective = _compute_watermark(source_max, row["allowed_lateness_seconds"])
+    else:
+        effective = None
     return {
         "session_id": row["session_id"],
-        "source_ids": json.loads(row["source_ids"]),
+        "source_ids": declared,
         "allowed_lateness_seconds": row["allowed_lateness_seconds"],
         "published_watermark": (
             format_event_time(parse_event_time(row["published_watermark"]))
@@ -172,6 +210,13 @@ def get_session(conn: sqlite3.Connection, session_id: str) -> dict[str, Any]:
         ),
         "all_sources_reported": all_reported,
         "effective_watermark": format_event_time(parse_event_time(effective)) if effective else None,
+        "closed": closed,
+        "closed_at": (
+            format_event_time(parse_event_time(row["closed_at"]))
+            if row["closed_at"]
+            else None
+        ),
+        "sources": sources,
         "created_at": format_event_time(parse_event_time(row["created_at"])),
     }
 
@@ -205,6 +250,15 @@ def ingest_batch(
         received_at = store_event_time(utc_now())
         lateness = session["allowed_lateness_seconds"]
         published_wm: Optional[str] = session["published_watermark"]
+        closed = session["closed_at"] is not None
+        sealed_sources = {
+            r["source_id"]
+            for r in conn.execute(
+                "SELECT source_id FROM session_sources"
+                " WHERE session_id = ? AND final_observed_at IS NOT NULL",
+                (session_id,),
+            )
+        }
 
         duplicates = 0
         quarantined = 0
@@ -226,8 +280,21 @@ def ingest_batch(
                         f"reading ({r['source_id']}, seq={r['seq']}) already exists"
                         " with a different payload"
                     )
+                # Idempotent retry: still a no-op after the source sealed or
+                # the session closed.
                 duplicates += 1
                 continue
+
+            # From here on the key is new.
+            if closed:
+                raise ConflictError(
+                    f"session {session_id!r} is closed; no new readings accepted"
+                )
+            if r["source_id"] in sealed_sources:
+                raise ConflictError(
+                    f"source {r['source_id']!r} is sealed"
+                    " (final_observed_at declared); no new readings accepted"
+                )
 
             if published_wm is not None and observed_store < published_wm:
                 # Too late: the timeline up to the watermark is immutable.
@@ -306,6 +373,147 @@ def ingest_batch(
         "published_total": published_total,
         "buffered": buffered,
         "all_sources_reported": all_reported,
+        "published_watermark": (
+            format_event_time(parse_event_time(published_wm)) if published_wm else None
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# source sealing (finite sessions) and the tail drain
+# ---------------------------------------------------------------------------
+
+def seal_source(
+    conn: sqlite3.Connection,
+    session_id: str,
+    source_id: str,
+    final_observed_at: str,
+) -> dict[str, Any]:
+    """Seal one source with its declared final event time.
+
+    Runs inside the same serialised write transaction (``BEGIN IMMEDIATE``)
+    as ingestion, so a seal can never race a report batch.  Sealing a
+    non-last source only records the value — the watermark keeps its
+    original semantics.  When the *last* open source seals, every remaining
+    buffered reading is published in the deterministic global order, both
+    alert pipelines advance and the session is marked ``closed``, all inside
+    this one transaction.
+    """
+    final_store = store_event_time(parse_event_time(final_observed_at))
+
+    with transaction(conn):
+        session = _load_session(conn, session_id)
+        allowed_sources = set(json.loads(session["source_ids"]))
+        if source_id not in allowed_sources:
+            raise BadRequestError(
+                f"unknown source_id {source_id!r} for this session;"
+                f" declared sources: {sorted(allowed_sources)}"
+            )
+        src = conn.execute(
+            "SELECT max_observed_at, final_observed_at FROM session_sources"
+            " WHERE session_id = ? AND source_id = ?",
+            (session_id, source_id),
+        ).fetchone()
+
+        received_at = store_event_time(utc_now())
+        already_sealed = False
+        published_now = 0
+        published_wm: Optional[str] = session["published_watermark"]
+
+        if src["final_observed_at"] is not None:
+            if src["final_observed_at"] != final_store:
+                raise ConflictError(
+                    f"source {source_id!r} is already sealed with final_observed_at "
+                    f"{format_event_time(parse_event_time(src['final_observed_at']))};"
+                    " a different value conflicts"
+                )
+            # Same value retried: idempotent no-op.
+            already_sealed = True
+        else:
+            if (
+                src["max_observed_at"] is not None
+                and final_store < src["max_observed_at"]
+            ):
+                raise BadRequestError(
+                    "final_observed_at must not be earlier than the source's"
+                    " max observed event time "
+                    f"{format_event_time(parse_event_time(src['max_observed_at']))};"
+                    f" got {format_event_time(parse_event_time(final_store))}"
+                )
+            conn.execute(
+                "UPDATE session_sources SET final_observed_at = ?"
+                " WHERE session_id = ? AND source_id = ?",
+                (final_store, session_id, source_id),
+            )
+
+            open_left = conn.execute(
+                "SELECT COUNT(*) AS c FROM session_sources"
+                " WHERE session_id = ? AND final_observed_at IS NULL",
+                (session_id,),
+            ).fetchone()["c"]
+            if open_left == 0:
+                # Last source sealed: drain every remaining buffered reading,
+                # advance both alert pipelines and close the session — all in
+                # this transaction.  Quarantined readings are untouched: they
+                # can never enter the published stream.
+                final_wm = conn.execute(
+                    "SELECT MAX(final_observed_at) AS m FROM session_sources"
+                    " WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()["m"]
+                if published_wm is not None and published_wm > final_wm:
+                    # Monotonicity guard (unreachable in practice:
+                    # published_wm <= min(maxes) - lateness <= max(finals)).
+                    final_wm = published_wm
+                cur = conn.execute(
+                    "UPDATE readings SET status = 'published', published_watermark = ?"
+                    " WHERE session_id = ? AND status = 'buffered'",
+                    (final_wm, session_id),
+                )
+                published_now = cur.rowcount
+                conn.execute(
+                    "UPDATE sessions SET published_watermark = ?, closed_at = ?"
+                    " WHERE session_id = ?",
+                    (final_wm, received_at, session_id),
+                )
+                published_wm = final_wm
+                if published_now:
+                    from .alerts import advance_alerts
+                    from .correlated import advance_correlated
+
+                    advance_alerts(conn, session_id, final_wm, received_at)
+                    # Cross-source rules consume the global merge order.
+                    advance_correlated(conn, session_id, final_wm, received_at)
+
+        sealed_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM session_sources"
+            " WHERE session_id = ? AND final_observed_at IS NOT NULL",
+            (session_id,),
+        ).fetchone()["c"]
+        closed = conn.execute(
+            "SELECT closed_at FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()["closed_at"] is not None
+        published_total = conn.execute(
+            "SELECT COUNT(*) AS c FROM readings WHERE session_id = ? AND status = 'published'",
+            (session_id,),
+        ).fetchone()["c"]
+        buffered = conn.execute(
+            "SELECT COUNT(*) AS c FROM readings WHERE session_id = ? AND status = 'buffered'",
+            (session_id,),
+        ).fetchone()["c"]
+
+    return {
+        "session_id": session_id,
+        "source_id": source_id,
+        "final_observed_at": format_event_time(parse_event_time(final_store)),
+        "already_sealed": already_sealed,
+        "sealed_sources": sealed_count,
+        "total_sources": len(allowed_sources),
+        "all_sources_sealed": sealed_count == len(allowed_sources),
+        "closed": closed,
+        "published_now": published_now,
+        "published_total": published_total,
+        "buffered": buffered,
         "published_watermark": (
             format_event_time(parse_event_time(published_wm)) if published_wm else None
         ),

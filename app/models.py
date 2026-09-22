@@ -89,6 +89,12 @@ class QuarantineResponse(BaseModel):
     readings: list[QuarantineOut]
 
 
+class SourceStatusOut(BaseModel):
+    source_id: str
+    max_observed_at: Optional[str] = None
+    final_observed_at: Optional[str] = None
+
+
 class SessionOut(BaseModel):
     session_id: str
     source_ids: list[str]
@@ -96,7 +102,42 @@ class SessionOut(BaseModel):
     published_watermark: Optional[str] = None
     all_sources_reported: bool
     effective_watermark: Optional[str] = None
+    closed: bool
+    closed_at: Optional[str] = None
+    sources: list[SourceStatusOut]
     created_at: str
+
+
+class SealSourceIn(BaseModel):
+    final_observed_at: str = Field(
+        ...,
+        description=(
+            "Declared final event time of the source; must not be earlier"
+            " than its max observed event time. ISO 8601 (UTC or with offset)."
+        ),
+    )
+
+    @field_validator("final_observed_at")
+    @classmethod
+    def _final_not_blank(cls, v: str) -> str:
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("final_observed_at must be a non-empty ISO 8601 string")
+        return v
+
+
+class SealResponse(BaseModel):
+    session_id: str
+    source_id: str
+    final_observed_at: str
+    already_sealed: bool
+    sealed_sources: int
+    total_sources: int
+    all_sources_sealed: bool
+    closed: bool
+    published_now: int
+    published_total: int
+    buffered: int
+    published_watermark: Optional[str] = None
 
 
 class CreatedSessionResponse(BaseModel):

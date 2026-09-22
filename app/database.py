@@ -188,8 +188,26 @@ CREATE TABLE correlated_events (
     )
 
 
+def _migration_2(conn: sqlite3.Connection, applied_at: str) -> None:
+    """Finite collection sessions: per-source sealing and session close.
+
+    ``session_sources.final_observed_at`` records a source's declared final
+    event time (NULL = still open); ``sessions.closed_at`` is set when the
+    last source seals and the remaining buffered readings are drained.
+    """
+    conn.execute("ALTER TABLE sessions ADD COLUMN closed_at TEXT")
+    conn.execute(
+        "ALTER TABLE session_sources ADD COLUMN final_observed_at TEXT"
+    )
+    conn.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?)",
+        (applied_at,),
+    )
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection, str], None]] = {
     1: _migration_1,
+    2: _migration_2,
 }
 LATEST_VERSION = max(MIGRATIONS)
 

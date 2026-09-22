@@ -28,6 +28,8 @@ from .models import (
     QuarantineResponse,
     ReadingIn,
     ReportResponse,
+    SealResponse,
+    SealSourceIn,
     SessionOut,
 )
 from .time_utils import TimestampError
@@ -42,7 +44,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lab Sensor Timeline Merge API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "Out-of-order sensor reporting with per-session fixed source lists, "
         "a slowest-source watermark (minus allowed lateness), deterministic "
@@ -50,7 +52,10 @@ app = FastAPI(
         "drive per-source threshold alert state machines (enter / active / "
         "recovered) with hysteresis and consecutive-count debouncing, plus "
         "cross-source correlated rules that fire once when 2-4 sources breach "
-        "their own thresholds together inside a shared event-time window."
+        "their own thresholds together inside a shared event-time window. "
+        "Finite sessions seal each source with a final_observed_at; the last "
+        "seal drains every buffered reading in merge order and closes the "
+        "session."
     ),
     lifespan=lifespan,
 )
@@ -179,6 +184,31 @@ def pull_quarantine(
 ) -> QuarantineResponse:
     """Late readings that arrived behind the already-published watermark."""
     return QuarantineResponse(**service.list_quarantined(conn, session_id, limit, cursor))
+
+
+@app.post(
+    "/sessions/{session_id}/sources/{source_id}/seal",
+    response_model=SealResponse,
+    status_code=200,
+    tags=["sessions"],
+)
+def seal_source(
+    session_id: str,
+    source_id: str,
+    body: SealSourceIn,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> SealResponse:
+    """Seal a source with its declared ``final_observed_at``.
+
+    Retrying with the same value is an idempotent no-op; a different value
+    returns 409.  When the last open source seals, all remaining buffered
+    readings are published in merge order, both alert pipelines advance and
+    the session closes — atomically, under the same write lock as ingestion.
+    """
+    result = service.seal_source(
+        conn, session_id, source_id, body.final_observed_at
+    )
+    return SealResponse(**result)
 
 
 # ---------------------------------------------------------------------------
