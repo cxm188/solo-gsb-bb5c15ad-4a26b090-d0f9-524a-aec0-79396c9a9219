@@ -5,6 +5,11 @@
 且此前尚未发布的读数，并按 `(observed_at, source_id, seq)` 输出**确定顺序**的归并流。
 越过**已发布**水位线才到达的迟到读数不会改写历史，而是进入**隔离区**供查询。
 
+采集会话是**有限集合**：每个来源可单独**封存（seal）**，声明自己的 `final_observed_at`；
+各来源陆续封存期间水位线语义不变，**最后一个来源封存时**，服务在同一写事务内把全部剩余
+buffered 读数按既定全局顺序一次性发布（**尾流发布**）、推进两类告警并把会话置为 `closed`，
+此后拒绝任何新 key。
+
 在此之上，本服务还提供两种发布后告警：
 
 1. **单来源阈值告警**：为会话内某个来源创建规则后，系统在**每一条确定发布的读数**上
@@ -18,7 +23,7 @@
 - 语言/框架：Python 3.11 · FastAPI · Uvicorn
 - 存储：SQLite（WAL 模式，单文件，零外部依赖）
 - 并发：写操作在 `BEGIN IMMEDIATE` 事务内串行化，水位线推进单调、发布只发生一次，
-  告警状态与发布在同一事务内推进
+  告警状态、来源封存与尾流发布均在同一把写锁/同一事务内推进，消除上报与封存的并发竞态
 
 ## 单条命令启动
 
@@ -52,22 +57,39 @@ docker compose up --build
 ```bash
 python3 -m pip install -r requirements.txt
 SENSOR_DB_PATH=./sensors.db uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行 84 个端到端行为测试（需 pytest、httpx）
+pytest -q        # 运行 109 个端到端行为测试（需 pytest、httpx）
 ```
 
 ## 时间线语义
 
 1. **创建会话固定来源列表与迟到容忍**：`source_ids` 之后不可更改；上报未知 `source_id` 返回 400。
-2. **首报门槛**：所有来源都至少上报一次后水位线才有定义；此前读数全部缓冲、不发布、不隔离。
+2. **首报门槛**：所有来源都至少上报一次（或被封存，封存即声明了最终事件时间）后水位线才有定义；
+   此前读数全部缓冲、不发布、不隔离。
 3. **水位线**：`WM = min(每个来源已知最大 observed_at) − allowed_lateness_seconds`，单调不减
-   （来源时钟回拨不会使已发布水位线倒退）。
+   （来源时钟回拨不会使已发布水位线倒退）。已封存来源以其 `final_observed_at` 作为已知最大值
+   参与同一个水位线计算，因此各来源陆续封存时水位线保持原有语义。
 4. **发布规则**：仅当 `observed_at < WM`（严格小于，落在边界上的读数继续等待）时发布；
    每次上报只发布此前未发布的缓冲读数。发布顺序固定为 `observed_at, source_id, seq`。
 5. **幂等**：重复提交 `(source_id, seq)` 且 `value` 相同 → 计为 `duplicates` 的空操作；
-   同 key 不同 payload → 409，且该批次整体回滚（不会半写）。
+   同 key 不同 payload → 409，且该批次整体回滚（不会半写）。来源封存、甚至会话关闭后，
+   完全相同的既有读数重试**仍然**计为 `duplicates`。
 6. **隔离（quarantine）**：读数到达时若 `observed_at < 已发布水位线`，它永远无法再进入已发布流，
    原样写入隔离区（记录当时的水位线），已发布历史不发生任何变化。
 7. 时间统一按 UTC 处理：接受 `...Z`、带偏移量（`+02:00`）或不带时区（按 UTC）的 ISO 8601 字符串。
+8. **来源封存（seal）**：封存接口为某来源声明 `final_observed_at`；该值**不得早于**该来源已见的
+   最大事件时间（否则 400）。同值重试幂等（返回相同的封存结果、不改变 `sealed_at`）；
+   已封存后用不同值封存 → 409。未知来源 → 400，会话不存在 → 404。
+9. **封存后拒绝新读数**：来源封存后，任何此前未见过的 `(source_id, seq)` 上报均返回 409；
+   但对**完全相同的既有读数**的重试照旧计为 `duplicates`，同 key 不同 payload 照旧 409。
+   批次中只要混入一条被封存来源的新 key，整批回滚。
+10. **尾流发布与关闭（close）**：当（且仅当）**最后一个**来源封存时，系统在封存所在的同一个
+    `BEGIN IMMEDIATE` 写事务内：把所有剩余 buffered 读数按既定全局顺序 `(observed_at,
+    source_id, seq)` 全部发布（以一个晚于任何缓冲事件时间的**终止水位线**一次性发布；
+    此前正常推进的水位线保持单调），随后推进全部单来源告警与跨来源复合告警，最后把会话置为
+    `closed`。关闭后任何新 key 上报一律 409（既有读数的相同重试仍计为 duplicates）。
+11. **同一把写锁**：封存与上报都在同一串行化写事务内执行，因此“封存与新读数并发”只会得到
+    两种线性化结果之一——读数先落库（封存照常进行），或封存先生效（新读数 409），
+    不会出现封存后仍混入新读数、或尾流发布遗漏/重复读数的竞态。
 
 ## 告警状态机语义
 
@@ -171,21 +193,45 @@ curl -s -X POST localhost:8000/sessions/lab-1/readings \
 本批一旦有新读数发布，相关告警规则会在**同一事务**内推进并可能生成事件。
 
 错误码：未知来源/非法时间/空批次 → 400；字段结构错误（缺字段、`seq<0` 等）→ 422；
-同 key 不同 payload → 409；会话不存在 → 404。
+同 key 不同 payload、向**已封存来源**或**已关闭会话**上报新 key → 409；会话不存在 → 404。
+注意：来源封存/会话关闭后，对完全相同既有读数的重试仍正常返回 200 并计入 `duplicates`。
 
-### 3. 拉取已发布流
+### 3. 封存来源（声明采集结束）
+
+`POST /sessions/{session_id}/sources/{source_id}/seal`
+
+```bash
+curl -s -X POST localhost:8000/sessions/lab-1/sources/thermometer-a/seal \
+  -H 'Content-Type: application/json' -d '{
+  "final_observed_at": "2026-09-21T10:05:00Z"
+}'
+```
+
+- `final_observed_at` 不得早于该来源已见的最大 `observed_at`，否则 400；
+  接受与读数上报相同的全部 ISO 8601 时间形式（统一按 UTC 归一化）。
+- **同值重试幂等**：对已封存来源用相同 `final_observed_at`（含不同写法但同一时刻，如
+  `...T12:05:00+02:00` 与 `...T10:05:00Z`）再次封存 → 200 且结果与首次完全一致
+  （`sealed_at` 不变）；用**不同**值封存 → 409。
+- 未知来源 → 400；会话不存在 → 404；请求体缺字段/为空 → 422。
+- 封存后该来源不再接受新读数（409），既有读数的相同重试仍计为 `duplicates`。
+- 封存非最后一个来源时，其 `final_observed_at` 按普通最大事件时间参与水位线推进，
+  可能立即发布一批读数；响应返回最新会话状态（结构同“会话状态”接口）。
+- **封存最后一个来源**时，响应中 `closed` 变为 `true`：全部剩余 buffered 读数已在同一事务内
+  按全局顺序发布、两类告警已推进完毕，此后任何新 key 上报均 409。
+
+### 4. 拉取已发布流
 
 `GET /sessions/{session_id}/stream?limit=100&cursor=...`
 
 - 只返回已发布读数，严格按 `(observed_at, source_id, seq)` 排序；
 - keyset 分页：响应中的 `next_cursor` 原样回传即可翻页，为 `null` 表示取完；
-- 每条读数带发布时的 `published_watermark`，响应体也带当前水位线。
+- 每条读数带发布时的 `published_watermark`，响应体也带当前水位线（尾流发布时为终止水位线）。
 
 ```bash
 curl -s 'localhost:8000/sessions/lab-1/stream?limit=50'
 ```
 
-### 4. 查看隔离项
+### 5. 查看隔离项
 
 `GET /sessions/{session_id}/quarantine?limit=100&cursor=...`
 
@@ -196,12 +242,38 @@ curl -s 'localhost:8000/sessions/lab-1/stream?limit=50'
 curl -s 'localhost:8000/sessions/lab-1/quarantine'
 ```
 
-### 5. 会话状态（辅助接口）
+### 6. 会话状态（辅助接口）
 
 `GET /sessions/{session_id}`：返回来源列表、迟到容忍、是否已全部首报、
-已发布水位线与当前计算出的有效水位线。
+已发布水位线与当前计算出的有效水位线，以及封存/关闭状态：
 
-### 6. 创建告警规则
+- 顶层 `status`（`open`/`closed`）、布尔 `closed` 与关闭时刻 `closed_at`；
+- `sources` 数组（按会话声明顺序）逐项给出 `source_id`、已见最大事件时间 `max_observed_at`、
+  封存值 `final_observed_at`、封存时刻 `sealed_at` 与布尔 `sealed`。
+
+```json
+{
+  "session_id": "lab-1",
+  "source_ids": ["thermometer-a", "thermometer-b"],
+  "allowed_lateness_seconds": 10.0,
+  "published_watermark": "2026-09-21T09:59:50Z",
+  "all_sources_reported": true,
+  "effective_watermark": "2026-09-21T09:59:50Z",
+  "created_at": "2026-09-22T06:00:00Z",
+  "status": "open",
+  "closed": false,
+  "closed_at": null,
+  "sources": [
+    {"source_id": "thermometer-a", "max_observed_at": "2026-09-21T10:00:00Z",
+     "final_observed_at": "2026-09-21T10:00:00Z",
+     "sealed_at": "2026-09-22T06:10:00Z", "sealed": true},
+    {"source_id": "thermometer-b", "max_observed_at": "2026-09-21T10:00:00Z",
+     "final_observed_at": null, "sealed_at": null, "sealed": false}
+  ]
+}
+```
+
+### 7. 创建告警规则
 
 `POST /sessions/{session_id}/alert-rules`
 
@@ -234,12 +306,12 @@ curl -s -X POST localhost:8000/sessions/lab-1/alert-rules \
 响应 201，含规则当前的 `state`（`normal`/`active`）与 `streak`。若该来源此前已有已发布读数，
 创建时立即回放并可能直接返回 `active` 且生成历史事件。
 
-### 7. 查询规则
+### 8. 查询规则
 
 - `GET /sessions/{session_id}/alert-rules`：列出会话全部规则（含当前状态）。
 - `GET /sessions/{session_id}/alert-rules/{rule_id}`：单条规则；不存在 → 404。
 
-### 8. 查询当前告警
+### 9. 查询当前告警
 
 `GET /sessions/{session_id}/alerts/current?source_id=...`
 
@@ -251,7 +323,7 @@ curl -s -X POST localhost:8000/sessions/lab-1/alert-rules \
 curl -s 'localhost:8000/sessions/lab-1/alerts/current'
 ```
 
-### 9. 查询告警历史（分页）
+### 10. 查询告警历史（分页）
 
 `GET /sessions/{session_id}/alerts/history?limit=100&cursor=...&source_id=...&rule_id=...&event_type=...`
 
@@ -264,7 +336,7 @@ curl -s 'localhost:8000/sessions/lab-1/alerts/current'
 curl -s 'localhost:8000/sessions/lab-1/alerts/history?limit=20&event_type=entered'
 ```
 
-### 10. 创建跨来源复合告警规则
+### 11. 创建跨来源复合告警规则
 
 `POST /sessions/{session_id}/correlated-rules`
 
@@ -295,12 +367,12 @@ curl -s -X POST localhost:8000/sessions/lab-1/correlated-rules \
 `last_seq`）。创建时立即回放，已有的已发布读数可能直接让规则返回 `correlated`。
 结构错误（条件数不在 2～4、来源重复、窗口非正、NaN 阈值等）→ 422；重复 `rule_id` → 409。
 
-### 11. 查询复合规则
+### 12. 查询复合规则
 
 - `GET /sessions/{session_id}/correlated-rules`：列出会话全部复合规则（含各条件最近命中）。
 - `GET /sessions/{session_id}/correlated-rules/{rule_id}`：单条规则；不存在 → 404。
 
-### 12. 查询当前复合命中
+### 13. 查询当前复合命中
 
 `GET /sessions/{session_id}/correlated-alerts/current`
 
@@ -312,7 +384,7 @@ curl -s -X POST localhost:8000/sessions/lab-1/correlated-rules \
 curl -s 'localhost:8000/sessions/lab-1/correlated-alerts/current'
 ```
 
-### 13. 查询复合事件历史（分页）
+### 14. 查询复合事件历史（分页）
 
 `GET /sessions/{session_id}/correlated-alerts/history?limit=100&cursor=...&rule_id=...`
 
@@ -330,7 +402,30 @@ curl -s 'localhost:8000/sessions/lab-1/correlated-alerts/history?limit=20'
 基础表（`CREATE TABLE IF NOT EXISTS`），并按 `schema_migrations` 表记录的版本号依次执行
 尚未应用的迁移；每个迁移与其版本登记在同一个 `BEGIN IMMEDIATE` 事务内提交。
 因此老版本数据库会在下次启动时**原地升级、不丢数据**，新数据库则直接建到最新版本，
-无需手工初始化。当前迁移版本：v1（跨来源复合告警的三张表）。
+无需手工初始化。当前迁移版本：
+
+- **v1**：跨来源复合告警的三张表（`correlated_rules` / `correlated_conditions` /
+  `correlated_events`）。
+- **v2**：有限采集会话封存——`sessions` 增加 `status`（`open`/`closed`）与 `closed_at`，
+  `session_sources` 增加 `final_observed_at` 与 `sealed_at`（老库升级后既有会话为
+  `open`、各来源未封存，行为不变）。
+
+## 端到端示例（来源封存与尾流发布）
+
+两个温度计，迟到容忍 10s。封存前后读数的命运：
+
+| 时刻/动作 | 结果 |
+| --- | --- |
+| A 上报 seq=1@:00、seq=2@:10；B 上报 seq=1@:20 | WM=:00，三条全部 buffered |
+| 封存 A `final_observed_at=:10` | A 封存；最慢来源仍为 A@:10，WM=:00，会话保持 `open` |
+| A 再上报 seq=3（任意时间） | **409**（新 key 拒绝）；重试 seq=2 同 payload → `duplicates=1` |
+| 再次封存 A 同值 :10 | 幂等 200，`sealed_at` 不变；改值封存 → **409** |
+| 封存 B `final_observed_at=:20`（最后一个来源） | 同一事务尾流发布：终止水位线 :20.000001，三条 buffered 全部按 `(observed_at, source_id, seq)` 发布；两类告警推进；会话 **closed** |
+| close 后上报 B seq=2 | **409 closed**；重试 B seq=1 同 payload → 仍计 `duplicates` |
+
+封存非最后一个来源时水位线完全沿用普通语义：例如上例若 B 在 A 封存后先把自己的
+`final_observed_at` 声明到 :40，则最慢来源变为 A@:10、WM 推进到 :00:00，seq=1@:00
+会在封存 B 的请求中被正常发布，而无需等待会话关闭。
 
 ## 端到端示例（滞回 + 连续次数）
 
@@ -381,7 +476,8 @@ curl -s 'localhost:8000/sessions/lab-1/correlated-alerts/history?limit=20'
 ├── tests/
 │   ├── test_api.py        # 时间线/隔离/幂等等端到端行为测试（22 个）
 │   ├── test_alerts.py     # 单来源告警状态机/滞回/连续次数/隔离/回放/分页测试（27 个）
-│   └── test_correlated.py # 跨来源复合/窗口/过期/再触发/隔离/回放/迁移测试（35 个）
+│   ├── test_correlated.py # 跨来源复合/窗口/过期/再触发/隔离/回放/迁移测试（35 个）
+│   └── test_sealing.py    # 来源封存/幂等冲突/尾流发布/关闭/封存-上报并发测试（25 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

@@ -655,14 +655,15 @@ class TestMigrations:
         finally:
             conn.close()
 
-        # Startup upgrade: migration 1 applies once and creates the new tables
-        # without touching existing data.
+        # Startup upgrade: migrations apply once and create the new tables
+        # without touching existing data (migration 2 also adds the
+        # source-sealing / session-closing columns).
         database.init_db(db_path)
         conn = sqlite3.connect(db_path)
         try:
             versions = [r[0] for r in conn.execute(
                 "SELECT version FROM schema_migrations ORDER BY version")]
-            assert versions == [1]
+            assert versions == [1, 2]
             row = conn.execute(
                 "SELECT session_id FROM sessions WHERE session_id = 'legacy-s'"
             ).fetchone()
@@ -673,6 +674,16 @@ class TestMigrations:
             }
             assert {"correlated_rules", "correlated_conditions",
                     "correlated_events"} <= names
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+            assert {"status", "closed_at"} <= cols
+            cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(session_sources)")}
+            assert {"final_observed_at", "sealed_at"} <= cols
+            # Legacy sessions upgrade open, with every source unsealed.
+            row = conn.execute(
+                "SELECT status, closed_at FROM sessions WHERE session_id = 'legacy-s'"
+            ).fetchone()
+            assert row[0] == "open" and row[1] is None
         finally:
             conn.close()
 
@@ -682,6 +693,9 @@ class TestMigrations:
         try:
             assert conn.execute(
                 "SELECT COUNT(*) FROM schema_migrations WHERE version = 1"
+            ).fetchone()[0] == 1
+            assert conn.execute(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 2"
             ).fetchone()[0] == 1
         finally:
             conn.close()

@@ -19,14 +19,19 @@ CREATE TABLE IF NOT EXISTS sessions (
     source_ids                TEXT NOT NULL,          -- JSON array, canonical order
     allowed_lateness_seconds  REAL NOT NULL,
     published_watermark       TEXT,                   -- NULL until first publish
-    created_at                TEXT NOT NULL
+    created_at                TEXT NOT NULL,
+    status                    TEXT NOT NULL DEFAULT 'open'
+                                   CHECK (status IN ('open','closed')),
+    closed_at                 TEXT                    -- set by the last source seal
 );
 
 CREATE TABLE IF NOT EXISTS session_sources (
-    session_id       TEXT NOT NULL REFERENCES sessions(session_id),
-    source_id        TEXT NOT NULL,
-    max_observed_at  TEXT,                            -- NULL = no report yet
-    first_seen_at    TEXT NOT NULL,
+    session_id        TEXT NOT NULL REFERENCES sessions(session_id),
+    source_id         TEXT NOT NULL,
+    max_observed_at   TEXT,                           -- NULL = no report yet
+    first_seen_at     TEXT NOT NULL,
+    final_observed_at TEXT,                           -- NULL = still open
+    sealed_at         TEXT,
     PRIMARY KEY (session_id, source_id)
 );
 
@@ -188,8 +193,55 @@ CREATE TABLE correlated_events (
     )
 
 
+def _add_column_if_missing(
+    conn: sqlite3.Connection, table: str, column: str, ddl: str
+) -> None:
+    """Idempotent ``ALTER TABLE ADD COLUMN`` (migrations must be re-runnable)."""
+    existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
+def _migration_2(conn: sqlite3.Connection, applied_at: str) -> None:
+    """Finite-collection source sealing and the closed-session tail flush.
+
+    A source may be sealed with a ``final_observed_at`` that is not earlier
+    than the largest event time ever seen for it.  Once every source of a
+    session is sealed the session closes: the write transaction that seals
+    the last source also publishes every remaining buffered reading under a
+    terminal watermark and drives both alert kinds before setting
+    ``sessions.status = 'closed'``.
+    """
+    _add_column_if_missing(
+        conn,
+        "sessions",
+        "status",
+        "status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed'))",
+    )
+    _add_column_if_missing(
+        conn, "sessions", "closed_at", "closed_at TEXT"
+    )
+    _add_column_if_missing(
+        conn,
+        "session_sources",
+        "final_observed_at",
+        "final_observed_at TEXT",
+    )
+    _add_column_if_missing(
+        conn,
+        "session_sources",
+        "sealed_at",
+        "sealed_at TEXT",
+    )
+    conn.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?)",
+        (applied_at,),
+    )
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection, str], None]] = {
     1: _migration_1,
+    2: _migration_2,
 }
 LATEST_VERSION = max(MIGRATIONS)
 

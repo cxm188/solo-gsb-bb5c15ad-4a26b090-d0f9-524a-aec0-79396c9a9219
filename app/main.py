@@ -28,6 +28,7 @@ from .models import (
     QuarantineResponse,
     ReadingIn,
     ReportResponse,
+    SealSourceIn,
     SessionOut,
 )
 from .time_utils import TimestampError
@@ -42,11 +43,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lab Sensor Timeline Merge API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "Out-of-order sensor reporting with per-session fixed source lists, "
         "a slowest-source watermark (minus allowed lateness), deterministic "
-        "publish order and late-reading quarantine. Published readings also "
+        "publish order and late-reading quarantine. Sources of a finite "
+        "collection can be sealed with their final observed event time; "
+        "sealing the last source tail-publishes every remaining buffered "
+        "reading and closes the session atomically. Published readings also "
         "drive per-source threshold alert state machines (enter / active / "
         "recovered) with hysteresis and consecutive-count debouncing, plus "
         "cross-source correlated rules that fire once when 2-4 sources breach "
@@ -101,6 +105,32 @@ def get_session(
     conn: sqlite3.Connection = Depends(get_db),
 ) -> SessionOut:
     return SessionOut(**service.get_session(conn, session_id))
+
+
+@app.post("/sessions/{session_id}/sources/{source_id}/seal",
+           response_model=SessionOut, status_code=200, tags=["sessions"])
+def seal_source(
+    session_id: str,
+    source_id: str,
+    body: SealSourceIn,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> SessionOut:
+    """Seal one finite-collection source at its final observed event time.
+
+    ``final_observed_at`` must not be earlier than the largest event time
+    already seen for the source.  Retrying with the same value is idempotent;
+    a different value returns 409.  Once the last source is sealed the
+    remaining buffered readings are tail-published in deterministic order,
+    both alert kinds are advanced and the session becomes ``closed`` -- all in
+    the same serialised write transaction.
+    """
+    result = service.seal_source(
+        conn,
+        session_id=session_id,
+        source_id=source_id,
+        final_observed_at=body.final_observed_at,
+    )
+    return SessionOut(**result)
 
 
 @app.post(
